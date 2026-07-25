@@ -42,7 +42,8 @@
   input,textarea{font-family:inherit}
   @media (max-width:1080px){ .fs-hdr-search{display:none !important} }
   </style>
-<script src="config/events.js"></script>
+<script src="config/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
   @media (max-width:1080px){ .fs-hdr-search{display:none !important} }
   @media (max-width:940px){ .fs-hdr-nav{display:none !important} .fs-hdr-burger{display:grid !important} }
@@ -1180,7 +1181,7 @@ class Component extends DCLogic {
     this.SEL={supply:'0x18160ddd',max:'0x32cb6b0c',price:'0x6817c76c',menabled:'0xd1239730',maxtx:'0xde7fcb1d',owner:'0x6352211e',listings:'0xad4d2448',getListing:'0x88700d1c',fee:'0x465de68b',decimals:'0x313ce567',
       mint:'0xa0712d68',setApprovalForAll:'0xa22cb465',isApprovedForAll:'0xe985e9c5',buyNFT:'0xa82ba76f',listNFT:'0xad05f1b4',makeOffer:'0x730ed93b',acceptOffer:'0x3bbb2806',cancelOffer:'0x058a56ac',cancelListing:'0xb2ddee06',approve:'0x095ea7b3',allowance:'0xdd62ed3e',updatePrice:'0xe57d6fb7'};
     this.TRANSFER_TOPIC='0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-    this.EVENTS=(typeof window!=='undefined'&&window.FEVO_EVENTS)||{appsScriptUrl:'',sheetId:'',refreshMs:5000};
+    this.SB=(typeof window!=='undefined'&&window.FEVO_SUPABASE)||{url:'',anonKey:'',table:'marketplace_events'};
     this.EXPLORER='https://stablescan.xyz';
     this.dec=6;
   }
@@ -1188,41 +1189,53 @@ class Component extends DCLogic {
     fetch('metadata/fevostable.tokens.json').then(r=>r.json()).then(m=>this.setState({meta:m})).catch(()=>{});
     this.loadChain();
     this.loadActivity();
-    this.loadSheet();
-    if(this.EVENTS.appsScriptUrl){ this._poll=setInterval(()=>this.loadSheet(), Math.max(2000,this.EVENTS.refreshMs||5000)); }
+    this.initSupabase();
   }
-  componentWillUnmount(){ if(this._tt)clearTimeout(this._tt); if(this._poll)clearInterval(this._poll); }
+  componentWillUnmount(){ if(this._tt)clearTimeout(this._tt); if(this._sbChannel&&this._sb){ this._sb.removeChannel(this._sbChannel); } }
 
-  // ---- Google Sheets live event mirror (blockchain stays source of truth) ----
-  async loadSheet(){
-    if(!this.EVENTS.appsScriptUrl){ if(this.state.sheetEvents===null) this.setState({sheetEvents:[]}); return; }
-    if(this._sheetInFlight) return; // never overlap polls
-    this._sheetInFlight=true;
+  // ---- Supabase realtime event mirror (blockchain stays source of truth) ----
+  initSupabase(){
     try{
-      const ctrl=(typeof AbortController!=='undefined')?new AbortController():null;
-      const to=ctrl?setTimeout(()=>ctrl.abort(),8000):null;
-      const r=await fetch(this.EVENTS.appsScriptUrl+'?type=all&limit=300',ctrl?{method:'GET',signal:ctrl.signal}:{method:'GET'});
-      if(to)clearTimeout(to);
-      const j=await r.json();
-      if(j&&j.ok){ this.setState({sheetEvents:j.events||[], volume:j.volume||null}); }
-      else if(this.state.sheetEvents===null){ this.setState({sheetEvents:[]}); }
-    }catch(e){ if(this.state.sheetEvents===null) this.setState({sheetEvents:[]}); }
-    finally{ this._sheetInFlight=false; }
+      if(!this.SB.url||!this.SB.anonKey||!(window.supabase&&window.supabase.createClient)){ this.setState({sheetEvents:[]}); return; }
+      this._sb=window.supabase.createClient(this.SB.url,this.SB.anonKey,{realtime:{params:{eventsPerSecond:10}}});
+      this.loadSupabase();
+      this._sbChannel=this._sb.channel('marketplace_events')
+        .on('postgres_changes',{event:'INSERT',schema:'public',table:this.SB.table},(payload)=>{
+          this.setState(s=>({sheetEvents:[this.rowToEv(payload.new),...(s.sheetEvents||[])]})); // realtime append, no reload
+        })
+        .subscribe();
+    }catch(e){ this.setState({sheetEvents:[]}); }
   }
-  async postEvent(ev){
-    if(!this.EVENTS.appsScriptUrl||!ev||!ev.txHash) return;
-    const body=Object.assign({timestamp:Date.now(),collection:'FevoStable Genesis',nftContract:this.NFT,marketplaceContract:this.MKT,
-      currency:'USDT0',network:'Stable Mainnet',status:'Confirmed',
-      explorerUrl:'https://stablescan.xyz/tx/'+ev.txHash, imageUrl: ev.tokenId!=null&&ev.tokenId!==''?(this.IMG+ev.tokenId+'.jpg'):''}, ev);
+  rowToEv(r){ return {EventType:r.event_type,TokenId:r.token_id,WalletFrom:r.wallet_from,WalletTo:r.wallet_to,Seller:r.seller,Buyer:r.buyer,OfferMaker:r.offer_maker,Price:r.price,TxHash:r.transaction_hash,Timestamp:r.created_at?new Date(r.created_at).getTime():Date.now()}; }
+  async loadSupabase(){
+    if(!this._sb) return;
     try{
-      const r=await fetch(this.EVENTS.appsScriptUrl,{method:'POST',redirect:'follow',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(body)});
-      let j=null; try{ j=await r.json(); }catch(pe){}
-      if(!r.ok||(j&&j.ok===false)){ this.showToast('Event sync failed: '+((j&&j.error)||('HTTP '+r.status))); }
-      else if(j&&j.duplicate){ /* already stored — fine */ }
+      const {data,error}=await this._sb.from(this.SB.table).select('*').order('created_at',{ascending:false}).limit(500);
+      if(error){ if(error.code!=='PGRST205'&&error.code!=='42P01') this.showToast('Supabase read failed: '+error.message); this.setState({sheetEvents:[]}); return; }
+      this.setState({sheetEvents:(data||[]).map(r=>this.rowToEv(r)), volume:this.computeVolume(data||[])});
+    }catch(e){ this.setState({sheetEvents:[]}); }
+  }
+  computeVolume(rows){ const now=Date.now(),DAY=86400000,a={h24:0,d7:0,d30:0,all:0};
+    (rows||[]).forEach(r=>{ if(r.event_type!=='Sale')return; const p=Number(r.price)||0; if(!p)return; a.all+=p;
+      const age=now-(r.created_at?new Date(r.created_at).getTime():0);
+      if(age<=DAY)a.h24+=p; if(age<=7*DAY)a.d7+=p; if(age<=30*DAY)a.d30+=p; }); return a; }
+  async postEvent(ev){
+    if(!this._sb||!ev||!ev.txHash) return;
+    const row={ block_number: ev.blockNumber||null, transaction_hash: ev.txHash, log_index: ev.logIndex||0,
+      event_type: ev.eventType, token_id: (ev.tokenId!=null&&ev.tokenId!=='')?String(ev.tokenId):null,
+      collection:'FevoStable Genesis', nft_contract:this.NFT, marketplace_contract:this.MKT,
+      seller: ev.seller||null, buyer: ev.buyer||null, offer_maker: ev.offerMaker||null,
+      wallet_from: ev.walletFrom||null, wallet_to: ev.walletTo||null,
+      price: ev.price!=null?ev.price:null, currency:'USDT0', status:'Confirmed', network:'Stable Mainnet',
+      image_url: (ev.tokenId!=null&&ev.tokenId!=='')?(this.IMG+ev.tokenId+'.jpg'):null,
+      explorer_url:'https://stablescan.xyz/tx/'+ev.txHash };
+    try{
+      const {error}=await this._sb.from(this.SB.table).insert(row);
+      if(error&&error.code!=='23505'){ this.showToast('Supabase sync failed: '+error.message); } // 23505 = duplicate (fine)
       else { this.showToast('Activity synced'); }
-    }catch(e){ this.showToast('Event sync failed: '+((e&&e.message)||'network error')); }
-    // refresh Activity / Offers / Recent Sales / Volume from the sheet
-    this.loadSheet();
+    }catch(e){ this.showToast('Supabase sync failed: '+((e&&e.message)||'network error')); }
+    // realtime broadcast refreshes every visitor; refresh volume locally too
+    this.loadSupabase();
   }
 
   async rpc(method,params){
@@ -1369,7 +1382,7 @@ class Component extends DCLogic {
     const listedTokens=(c.listedIds||[]).map(id=>this.getToken(id));
     const recentCards=listedTokens.slice(0,12).map(t=>({id:t.id,name:t.name,glow:t.glow,glow2:t.glow2,priceLabel:priceLabel(t.price),open:()=>this.openItem(t.id)}));
     const hasListings=(c.listedIds||[]).length>0;
-    const latestSales=(st.sheetEvents||[]).filter(r=>r.EventType==='Buy'||r.EventType==='Accept Offer').slice(0,10).map(r=>{
+    const latestSales=(st.sheetEvents||[]).filter(r=>r.EventType==='Sale').slice(0,10).map(r=>{
       const id=(r.TokenId===''||r.TokenId==null)?null:Number(r.TokenId);
       const g=(m&&id!=null&&m.tokens[id])?m.tokens[id]:{g:'#39F5A6',g2:'#2CE0E0'};
       return {id,name:id!=null?('FevoStable #'+id):'—',glow:g.g,glow2:g.g2,price:r.Price?this.fmtP(+r.Price)+' USDT0':'—',time:'',open:()=>{ if(id!=null) this.openItem(id); }};
@@ -1378,7 +1391,7 @@ class Component extends DCLogic {
     const orNa=(v,suffix)=> v==null?'—':(this.fmt(v)+(suffix||''));
     const vol=st.volume||{};
     const volLabel=(v)=> (v==null)?'—':(this.fmtP(v)+' USDT0');
-    const topOffer=(st.sheetEvents||[]).filter(r=>r.EventType==='Make Offer').reduce((a,r)=>Math.max(a,+r.Price||0),0);
+    const topOffer=(st.sheetEvents||[]).filter(r=>r.EventType==='Offer').reduce((a,r)=>Math.max(a,+r.Price||0),0);
     const collectionStats=[
       {label:'FLOOR',value:floor==null?'—':this.fmtP(floor)+' USDT0'},
       {label:'TOP OFFER',value:topOffer?this.fmtP(topOffer)+' USDT0':'—'},
@@ -1414,8 +1427,8 @@ class Component extends DCLogic {
     const explorerAddr=(a)=>'https://stablescan.xyz/address/'+a;
     // Event badge colors: Sale green, Mint blue, Listing orange, Transfer purple, Offer yellow,
     // Offer Accepted red, Offer Cancelled gray, Price Updated cyan, Cancel Listing dark gray.
-    const evStyle={Mint:['#5AD1FF','✦'],List:['#FF9F45','⊕'],'Update Listing Price':['#2CE0E0','↺'],'Cancel Listing':['#6B7C74','⊘'],Buy:['#39F5A6','◆'],'Make Offer':['#FFC24B','⤴'],'Accept Offer':['#FF6B78','✓'],'Cancel Offer':['#8FA69D','⊘'],Transfer:['#B478FF','⇄']};
-    const priceColorFor=(ev)=>({Buy:'#39F5A6','Accept Offer':'#FF6B78',List:'#FF9F45','Update Listing Price':'#5AD1FF'}[ev]||'#EAF4EF');
+    const evStyle={Mint:['#5AD1FF','✦'],Listing:['#FF9F45','⊕'],'Price Updated':['#2CE0E0','↺'],'Cancel Listing':['#6B7C74','⊘'],Sale:['#39F5A6','◆'],Offer:['#FFC24B','⤴'],'Offer Accepted':['#FF6B78','✓'],'Offer Cancelled':['#8FA69D','⊘'],Transfer:['#B478FF','⇄']};
+    const priceColorFor=(ev)=>({Sale:'#39F5A6','Offer Accepted':'#FF6B78',Listing:'#FF9F45','Price Updated':'#5AD1FF'}[ev]||'#EAF4EF');
     // Sheet mirror is preferred; falls back to on-chain Transfer scan when no sheet configured.
     const sheet=st.sheetEvents;
     let baseEvents;
@@ -1435,10 +1448,10 @@ class Component extends DCLogic {
       parties:(e.fromA?this.short(e.fromA):'—')+' → '+(e.toA?this.short(e.toA):'—'), time:e.hash?this.short(e.hash):'—',
       open:()=>{ if(e.hash) window.open(explorerTx(e.hash),'_blank','noopener'); }}; };
     const activity=baseEvents.map(mapEv);
-    const actMap={All:null,Sale:'Buy',Mint:'Mint',Transfer:'Transfer',Listing:'List',Offer:'Make Offer','Offer Accepted':'Accept Offer','Offer Cancelled':'Cancel Offer','Price Updated':'Update Listing Price','Cancel Listing':'Cancel Listing'};
+    const actMap={All:null,Sale:'Sale',Mint:'Mint',Transfer:'Transfer',Listing:'Listing',Offer:'Offer','Offer Accepted':'Offer Accepted','Offer Cancelled':'Offer Cancelled','Price Updated':'Price Updated','Cancel Listing':'Cancel Listing'};
     const globalActivity=baseEvents.filter(e=>!actMap[st.actFilter]||e.event===actMap[st.actFilter]).map(mapEv);
     // Offers + recent sales derived from the same mirror
-    const collOffers=baseEvents.filter(e=>e.event==='Make Offer').slice(0,8).map(e=>({price:e.price,diff:'—',diffColor:'#8FA69D',exp:'—',from:e.fromA?this.short(e.fromA):'—'}));
+    const collOffers=baseEvents.filter(e=>e.event==='Offer').slice(0,8).map(e=>({price:e.price,diff:'—',diffColor:'#8FA69D',exp:'—',from:e.fromA?this.short(e.fromA):'—'}));
     const actFilters=['All','Sale','Mint','Transfer','Listing','Offer','Offer Accepted','Offer Cancelled','Price Updated','Cancel Listing'].map(k=>({label:k,color:st.actFilter===k?'#04120c':'#C7D8D0',bg:st.actFilter===k?'#39F5A6':'transparent',select:()=>this.setState({actFilter:k})}));
 
     const tok=this.getToken(st.itemId);
@@ -1821,32 +1834,32 @@ class Component extends DCLogic {
         const total=price + price*BigInt(feeBps)/10000n + price*500n/10000n; // price + fee + 5% royalty
         const allw=await this.readAllowance(owner);
         if(allw<total) steps.push({label:'Approve USDT0',to:this.USDT,data:this.SEL.approve+this.encAddr(this.MKT)+this.encUint(total)});
-        steps.push({label:'Buy NFT',to:this.MKT,data:this.SEL.buyNFT+this.encAddr(this.NFT)+this.encUint(md.id),event:{eventType:'Buy',tokenId:md.id,buyer:owner,seller:t.seller||'',price:t.price||0,walletTo:owner}});
+        steps.push({label:'Buy NFT',to:this.MKT,data:this.SEL.buyNFT+this.encAddr(this.NFT)+this.encUint(md.id),event:{eventType:'Sale',tokenId:md.id,buyer:owner,seller:t.seller||'',price:t.price||0,walletTo:owner}});
       } else if(md.type==='cart'){
         const toks=this.state.cart.map(id=>this.getToken(id)); const sum=toks.reduce((a,x)=>a+this.toBase(x.price||0),0n);
         const total=sum + sum*BigInt(feeBps)/10000n + sum*500n/10000n;
         const allw=await this.readAllowance(owner);
         if(allw<total) steps.push({label:'Approve USDT0',to:this.USDT,data:this.SEL.approve+this.encAddr(this.MKT)+this.encUint(total)});
-        toks.forEach(t=>steps.push({label:'Buy '+t.name,to:this.MKT,data:this.SEL.buyNFT+this.encAddr(this.NFT)+this.encUint(t.id),event:{eventType:'Buy',tokenId:t.id,buyer:owner,seller:t.seller||'',price:t.price||0,walletTo:owner}}));
+        toks.forEach(t=>steps.push({label:'Buy '+t.name,to:this.MKT,data:this.SEL.buyNFT+this.encAddr(this.NFT)+this.encUint(t.id),event:{eventType:'Sale',tokenId:t.id,buyer:owner,seller:t.seller||'',price:t.price||0,walletTo:owner}}));
       } else if(md.type==='offer'){
         const amt=this.toBase(this.state.offerAmount);
         const allw=await this.readAllowance(owner);
         if(allw<amt) steps.push({label:'Approve USDT0',to:this.USDT,data:this.SEL.approve+this.encAddr(this.MKT)+this.encUint(amt)});
-        steps.push({label:'Make offer',to:this.MKT,data:this.SEL.makeOffer+this.encAddr(this.NFT)+this.encUint(md.id)+this.encUint(amt)+this.encUint(this.durationSecs()),event:{eventType:'Make Offer',tokenId:md.id,offerMaker:owner,price:+this.state.offerAmount}});
+        steps.push({label:'Make offer',to:this.MKT,data:this.SEL.makeOffer+this.encAddr(this.NFT)+this.encUint(md.id)+this.encUint(amt)+this.encUint(this.durationSecs()),event:{eventType:'Offer',tokenId:md.id,offerMaker:owner,price:+this.state.offerAmount}});
       } else if(md.type==='list'){
         const price=this.toBase(this.state.listPrice);
         const approved=await this.readApprovedForAll(owner);
         if(!approved) steps.push({label:'Approve collection',to:this.NFT,data:this.SEL.setApprovalForAll+this.encAddr(this.MKT)+this.encUint(1)});
-        steps.push({label:'List NFT',to:this.MKT,data:this.SEL.listNFT+this.encAddr(this.NFT)+this.encUint(md.id)+this.encUint(price),event:{eventType:'List',tokenId:md.id,seller:owner,walletFrom:owner,price:+this.state.listPrice}});
+        steps.push({label:'List NFT',to:this.MKT,data:this.SEL.listNFT+this.encAddr(this.NFT)+this.encUint(md.id)+this.encUint(price),event:{eventType:'Listing',tokenId:md.id,seller:owner,walletFrom:owner,price:+this.state.listPrice}});
       } else if(md.type==='editprice'){
         const price=this.toBase(this.state.listPrice);
-        steps.push({label:'Update price',to:this.MKT,data:this.SEL.updatePrice+this.encAddr(this.NFT)+this.encUint(md.id)+this.encUint(price),event:{eventType:'Update Listing Price',tokenId:md.id,seller:owner,price:+this.state.listPrice}});
+        steps.push({label:'Update price',to:this.MKT,data:this.SEL.updatePrice+this.encAddr(this.NFT)+this.encUint(md.id)+this.encUint(price),event:{eventType:'Price Updated',tokenId:md.id,seller:owner,price:+this.state.listPrice}});
       } else if(md.type==='cancel'){
-        steps.push({label:'Cancel listing',to:this.MKT,data:this.SEL.cancelListing+this.encAddr(this.NFT)+this.encUint(md.id),event:{eventType:'Cancel Listing',tokenId:md.id,seller:owner}});
+        steps.push({label:'Cancel listing',to:this.MKT,data:this.SEL.cancelListing+this.encAddr(this.NFT)+this.encUint(md.id),event:{eventType:'Cancel Listing',tokenId:md.id,seller:owner,walletFrom:owner}});
       } else if(md.type==='mint'){
         const qty=this.state.mintQty; const mp=c.mintPrice;
         if(mp&&mp>0){ const cost=this.toBase(mp*qty); const allw=await this.readAllowance(owner); if(allw<cost) steps.push({label:'Approve USDT0',to:this.USDT,data:this.SEL.approve+this.encAddr(this.NFT)+this.encUint(cost)}); }
-        steps.push({label:'Mint',to:this.NFT,data:this.SEL.mint+this.encUint(qty),event:{eventType:'Mint',tokenId:'',buyer:owner,walletTo:owner,price:mp?mp*qty:0}});
+        steps.push({label:'Mint',to:this.NFT,data:this.SEL.mint+this.encUint(qty),event:{eventType:'Mint',tokenId:'',buyer:owner,walletTo:owner,walletFrom:owner,price:mp?mp*qty:0}});
       }
       if(!steps.length){ this.setState({txStep:'failed',txErr:'Nothing to submit.'}); return; }
       await this.runSteps(steps);
