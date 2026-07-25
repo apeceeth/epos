@@ -1168,6 +1168,7 @@ class Component extends DCLogic {
       watch:[], settings:{offers:true,sales:true,drops:false,mints:true},
       addr:null, chainId:null, balance:null, wrongNetwork:false, connecting:null, walletErr:null,
       ownedTokens:null, ownedLoading:false, editProfile:false, profile:{name:'',bio:'',x:''},
+      hasClaimedFree:null,
       activityEvents:null, sheetEvents:null, volume:null,
       toast:null
     };
@@ -1179,7 +1180,7 @@ class Component extends DCLogic {
     this.IMG='https://raw.githubusercontent.com/FevoStable/fevostableimage/main/images/';
     this.RPCS=['https://stable-mainnet.g.alchemy.com/v2/alch_WV_rxIrdGNksgTX-pgohg','https://stable-mainnet.g.alchemy.com/v2/alch_TpQ756y73jjEJBTM8dt3e','https://stable-mainnet.g.alchemy.com/v2/alch_N5qjELiELs8NlCE7Md4bA'];
     this.SEL={supply:'0x18160ddd',max:'0x32cb6b0c',price:'0x6817c76c',menabled:'0xd1239730',maxtx:'0xde7fcb1d',owner:'0x6352211e',listings:'0xad4d2448',getListing:'0x88700d1c',fee:'0x465de68b',decimals:'0x313ce567',
-      mint:'0xa0712d68',setApprovalForAll:'0xa22cb465',isApprovedForAll:'0xe985e9c5',buyNFT:'0xa82ba76f',listNFT:'0xad05f1b4',makeOffer:'0x730ed93b',acceptOffer:'0x3bbb2806',cancelOffer:'0x058a56ac',cancelListing:'0xb2ddee06',approve:'0x095ea7b3',allowance:'0xdd62ed3e',updatePrice:'0xe57d6fb7'};
+      mint:'0xa0712d68',setApprovalForAll:'0xa22cb465',isApprovedForAll:'0xe985e9c5',buyNFT:'0xa82ba76f',listNFT:'0xad05f1b4',makeOffer:'0x730ed93b',acceptOffer:'0x3bbb2806',cancelOffer:'0x058a56ac',cancelListing:'0xb2ddee06',approve:'0x095ea7b3',allowance:'0xdd62ed3e',updatePrice:'0xe57d6fb7',freeLimit:'0xa7048ae1',hasClaimedFree:'0x428640d8'};
     this.TRANSFER_TOPIC='0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
     this.SB=(typeof window!=='undefined'&&window.FEVO_SUPABASE)||{url:'',anonKey:'',table:'marketplace_events'};
     this.EXPLORER='https://stablescan.xyz';
@@ -1261,14 +1262,15 @@ class Component extends DCLogic {
     try{ const dh=await this.ethCall(this.USDT,this.SEL.decimals); if(dh) this.dec=Number(BigInt(dh)); }catch(e){}
     const div=Math.pow(10,this.dec);
     try{
-      const [supH,maxH,priceH,enH,mtxH,feeH,lstH]=await Promise.all([
+      const [supH,maxH,priceH,enH,mtxH,feeH,lstH,flH]=await Promise.all([
         this.ethCall(this.NFT,this.SEL.supply),
         this.ethCall(this.NFT,this.SEL.max).catch(()=>null),
         this.ethCall(this.NFT,this.SEL.price).catch(()=>null),
         this.ethCall(this.NFT,this.SEL.menabled).catch(()=>null),
         this.ethCall(this.NFT,this.SEL.maxtx).catch(()=>null),
         this.ethCall(this.MKT,this.SEL.fee).catch(()=>null),
-        this.ethCall(this.MKT,this.SEL.listings+this.encAddr(this.NFT)).catch(()=>null)
+        this.ethCall(this.MKT,this.SEL.listings+this.encAddr(this.NFT)).catch(()=>null),
+        this.ethCall(this.NFT,this.SEL.freeLimit).catch(()=>null)
       ]);
       const listings={}, listedIds=[];
       if(lstH){ this.decodeListings(lstH).forEach(o=>{ listings[o.id]={priceNum:Number(o.price)/div,seller:o.seller}; listedIds.push(o.id); }); }
@@ -1281,6 +1283,7 @@ class Component extends DCLogic {
         mintEnabled:enH!=null?BigInt(enH)!==0n:null,
         maxtx:mtxH!=null?Number(BigInt(mtxH)):null,
         feeBps:feeH!=null?Number(BigInt(feeH)):null,
+        freeLimit:flH!=null?Number(BigInt(flH)):null,
         listings,listedIds,floor
       },chainReady:true});
     }catch(e){ this.setState({chainReady:false,chainErr:true}); }
@@ -1527,17 +1530,34 @@ class Component extends DCLogic {
     // mint (real)
     const mp=c.mintPrice, mx=c.max, minted=supply, en=c.mintEnabled;
     const perTx=c.maxtx||5;
+    const qty=st.mintQty;
+    // Free/paid transition read entirely from contract — never hardcoded.
+    const freeLimit=c.freeLimit!=null?c.freeLimit:null;               // FREE_MINT_LIMIT()
+    const freeGlobalLeft=(freeLimit!=null&&minted!=null)?Math.max(0,freeLimit-Math.min(minted,freeLimit)):null;
+    const walletClaimedFree=st.hasClaimedFree;                        // hasClaimedFreeMint(wallet)
+    // This wallet is free-eligible only if: connected, hasn't claimed, and global free allocation remains.
+    const walletFreeEligible = st.wallet && walletClaimedFree===false && freeGlobalLeft!=null && freeGlobalLeft>0;
+    const freePhaseActive = freeGlobalLeft!=null && freeGlobalLeft>0; // free phase still open globally
+    // One free unit per eligible wallet; all remaining units are paid. No hardcoded cap.
+    const paidUnits = walletFreeEligible ? Math.max(0,qty-1) : qty;
+    const mCost = mp==null?null:mp*paidUnits;
+    const isPaidMint = paidUnits>0;
     const mPriceLabel = mp==null?'—':(mp===0?'Free':this.fmtP(mp)+' USDT0');
     const mPct = (mx&&minted!=null)?(minted/mx*100):null;
-    const mStateLabel = en==null?'Loading…':(en?'Public mint · live':'Mint not active');
-    const qty=st.mintQty;
-    // First 100 eligible wallets each receive ONE free mint. Derived from real supply — never hardcoded.
-    const freeRemaining = minted==null?null:Math.max(0,100-Math.min(minted,100));
-    const freeAvailable = freeRemaining!=null && freeRemaining>0;
-    // First unit may be free (if free mints remain); the rest are paid. No cap on paid quantity.
-    const paidUnits = freeAvailable ? Math.max(0,qty-1) : qty;
-    const mCost = mp==null?null:mp*paidUnits;
+    // Phase label follows real contract state.
+    let mPhaseLabel;
+    if(en===false||en==null) mPhaseLabel = en==null?'Loading…':'Mint not active';
+    else if(walletFreeEligible) mPhaseLabel = 'Free Mint Available';
+    else if(freePhaseActive && st.wallet && walletClaimedFree) mPhaseLabel = 'Paid Mint · free already claimed';
+    else if(freePhaseActive) mPhaseLabel = 'Free Mint Available';
+    else mPhaseLabel = 'Paid Mint';
+    const mStateLabel = mPhaseLabel;
     const mTotalLabel = mp==null?'—':(mCost===0?'Free · gas only':this.fmtP(mCost)+' USDT0');
+    const mFreeLine = freeGlobalLeft==null?'Loading mint state…'
+      : (walletFreeEligible ? ('✓ Free Mint Available · '+freeGlobalLeft+' of '+freeLimit+' free mints left')
+      : (st.wallet && walletClaimedFree ? ('Paid Mint · you already claimed your free mint · price '+mPriceLabel)
+      : (freePhaseActive ? (freeGlobalLeft+' of '+freeLimit+' free mints remaining')
+      : ('Free mint ended · Paid Mint · price '+mPriceLabel))));
     const featuredImg = supply?this.IMG+'1.jpg':'';
 
     // ===== MODAL =====
@@ -1637,7 +1657,7 @@ class Component extends DCLogic {
       mintInc:()=>this.setState(s=>({mintQty:s.mintQty+1})), mintDec:()=>this.setState(s=>({mintQty:Math.max(1,s.mintQty-1)})),
       doMint:()=>{ if(this.needWallet())return; this.setState({modal:{type:'mint'}}); this.buildAndRun({type:'mint'}); },
       mMinted:orNa(minted), mTotal:orNa(mx), mPriceLabel, mStateLabel, featuredImg,
-      mFreeRemaining: freeRemaining==null?'—':(freeRemaining+' Free Mints Remaining'), mFreeAvailable:freeAvailable,
+      mFreeRemaining: mFreeLine, mFreeAvailable:walletFreeEligible, mIsPaid:isPaidMint,
       mPctW:(mPct==null?0:mPct)+'%', mPctLabel:mPct==null?'—':mPct.toFixed(1)+'%',
       profileTabs, profTabCards, profEmptyMsg, profHasCards:profTabCards.length>0, profNoCards:profTabCards.length===0,
       profShowGrid, profShowOffers, profShowActivity, profShowCreated, profLoading:st.ownedLoading,
@@ -1731,6 +1751,9 @@ class Component extends DCLogic {
       this.setState({chainId:cid2,wrongNetwork:!ok}); return ok;
     }catch(e){ this.setState({wrongNetwork:true}); return false; }
   }
+  async loadFreeMintStatus(addr){
+    try{ const h=await this.ethCall(this.NFT,this.SEL.hasClaimedFree+this.encAddr(addr)); this.setState({hasClaimedFree: h!=null?BigInt(h)!==0n:null}); }catch(e){ this.setState({hasClaimedFree:null}); }
+  }
   async loadBalance(addr){
     try{ const data='0x70a08231'+addr.toLowerCase().replace('0x','').padStart(64,'0');
       const h=await this.ethCall(this.USDT,data); if(h!=null) this.setState({balance:Number(BigInt(h))/Math.pow(10,this.dec)}); }catch(e){}
@@ -1750,6 +1773,7 @@ class Component extends DCLogic {
       this._provider=provider;
       await this.ensureNetwork(provider);
       this.loadBalance(addr);
+      this.loadFreeMintStatus(addr);
       this.setState({wallet:true,addr,modal:null,connecting:null});
       this.loadOwned(addr);
       this.showToast('Wallet connected');
@@ -1791,7 +1815,7 @@ class Component extends DCLogic {
       this.refreshAll();
     }catch(e){ this.setState({txStep:'failed',txErr:(e&&e.code===4001)?'Transaction rejected in wallet.':((e&&e.message)||'Transaction failed.')}); }
   }
-  refreshAll(){ this.loadChain(); this.loadActivity(); if(this.state.addr) this.loadOwned(this.state.addr); }
+  refreshAll(){ this.loadChain(); this.loadActivity(); if(this.state.addr){ this.loadOwned(this.state.addr); this.loadFreeMintStatus(this.state.addr); this.loadBalance(this.state.addr); } }
   async loadActivity(){
     try{
       const latestHex=await this.rpc('eth_blockNumber',[]); const latest=BigInt(latestHex);
@@ -1858,8 +1882,14 @@ class Component extends DCLogic {
         steps.push({label:'Cancel listing',to:this.MKT,data:this.SEL.cancelListing+this.encAddr(this.NFT)+this.encUint(md.id),event:{eventType:'Cancel Listing',tokenId:md.id,seller:owner,walletFrom:owner}});
       } else if(md.type==='mint'){
         const qty=this.state.mintQty; const mp=c.mintPrice;
-        if(mp&&mp>0){ const cost=this.toBase(mp*qty); const allw=await this.readAllowance(owner); if(allw<cost) steps.push({label:'Approve USDT0',to:this.USDT,data:this.SEL.approve+this.encAddr(this.NFT)+this.encUint(cost)}); }
-        steps.push({label:'Mint',to:this.NFT,data:this.SEL.mint+this.encUint(qty),event:{eventType:'Mint',tokenId:'',buyer:owner,walletTo:owner,walletFrom:owner,price:mp?mp*qty:0}});
+        // Determine paid units from REAL contract state: one free unit only if wallet is free-eligible.
+        let claimed=this.state.hasClaimedFree; if(claimed==null){ try{ const hh=await this.ethCall(this.NFT,this.SEL.hasClaimedFree+this.encAddr(owner)); claimed=hh!=null?BigInt(hh)!==0n:true; }catch(e){ claimed=true; } }
+        const freeLimit=c.freeLimit, minted=c.supply;
+        const freeGlobalLeft=(freeLimit!=null&&minted!=null)?Math.max(0,freeLimit-Math.min(minted,freeLimit)):0;
+        const freeEligible = claimed===false && freeGlobalLeft>0;
+        const paidUnits = freeEligible ? Math.max(0,qty-1) : qty;
+        if(mp&&mp>0&&paidUnits>0){ const cost=this.toBase(mp*paidUnits); const allw=await this.readAllowance(owner); if(allw<cost) steps.push({label:'Approve USDT0',to:this.USDT,data:this.SEL.approve+this.encAddr(this.NFT)+this.encUint(cost)}); }
+        steps.push({label: paidUnits>0?'Paid mint':'Free mint',to:this.NFT,data:this.SEL.mint+this.encUint(qty),event:{eventType:'Mint',tokenId:'',buyer:owner,walletTo:owner,walletFrom:owner,price:mp?mp*paidUnits:0}});
       }
       if(!steps.length){ this.setState({txStep:'failed',txErr:'Nothing to submit.'}); return; }
       await this.runSteps(steps);
