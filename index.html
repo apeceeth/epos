@@ -1213,8 +1213,15 @@ class Component extends DCLogic {
     if(!this.EVENTS.appsScriptUrl||!ev||!ev.txHash) return;
     const body=Object.assign({timestamp:Date.now(),collection:'FevoStable Genesis',nftContract:this.NFT,marketplaceContract:this.MKT,
       currency:'USDT0',network:'Stable Mainnet',status:'Confirmed',
-      explorerUrl:'https://stablescan.xyz/tx/'+ev.txHash, imageUrl: ev.tokenId!=null?(this.IMG+ev.tokenId+'.jpg'):''}, ev);
-    try{ await fetch(this.EVENTS.appsScriptUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(body)}); }catch(e){}
+      explorerUrl:'https://stablescan.xyz/tx/'+ev.txHash, imageUrl: ev.tokenId!=null&&ev.tokenId!==''?(this.IMG+ev.tokenId+'.jpg'):''}, ev);
+    try{
+      const r=await fetch(this.EVENTS.appsScriptUrl,{method:'POST',redirect:'follow',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(body)});
+      let j=null; try{ j=await r.json(); }catch(pe){}
+      if(!r.ok||(j&&j.ok===false)){ this.showToast('Event sync failed: '+((j&&j.error)||('HTTP '+r.status))); }
+      else if(j&&j.duplicate){ /* already stored — fine */ }
+      else { this.showToast('Activity synced'); }
+    }catch(e){ this.showToast('Event sync failed: '+((e&&e.message)||'network error')); }
+    // refresh Activity / Offers / Recent Sales / Volume from the sheet
     this.loadSheet();
   }
 
@@ -1752,7 +1759,7 @@ class Component extends DCLogic {
     for(let i=0;i<80;i++){
       await new Promise(r=>setTimeout(r,3000));
       let rec=null; try{ rec=await this.rpc('eth_getTransactionReceipt',[hash]); }catch(e){}
-      if(rec){ return {ok:(rec.status==='0x1'),hash,reason:rec.status==='0x1'?null:'reverted'}; }
+      if(rec){ return {ok:(rec.status==='0x1'),hash,reason:rec.status==='0x1'?null:'reverted',blockNumber: rec.blockNumber?Number(BigInt(rec.blockNumber)):'', receipt:rec}; }
     }
     return {ok:false,hash,reason:'timeout'};
   }
@@ -1765,7 +1772,7 @@ class Component extends DCLogic {
         const res=await this.sendAndWait(s.to,s.data,s.value);
         if(!res.ok){ this.setState({txStep:'failed',txHash:res.hash,txErr: res.reason==='reverted'?'Transaction reverted on-chain.':'Transaction not confirmed (timed out).'}); return; }
         lastHash=res.hash;
-        if(s.event){ this.postEvent(Object.assign({txHash:res.hash},s.event)); } // store only after confirmation
+        if(s.event){ await this.postEvent(Object.assign({txHash:res.hash,blockNumber:res.blockNumber,walletFrom:s.event.walletFrom||this.state.addr},s.event)); } // store only after confirmation
       }
       this.setState({txStep:'success'});
       this.refreshAll();
